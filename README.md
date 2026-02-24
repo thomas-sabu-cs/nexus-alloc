@@ -81,5 +81,4 @@ and then run the tests/benchmarks as usual. (ASan flags are typically added via 
   - Provides `allocate()`, `deallocate()`, `reallocate()` API
   - Exposes stats for benchmarking and observability
 
-The implementation is carefully structured to be **readable**, **testable**, and to highlight systems-level C++ skills suitable for companies like **NVIDIA**.
 
