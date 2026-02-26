@@ -1,5 +1,6 @@
 #include "MemoryAllocator.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -44,18 +45,23 @@ struct BenchmarkConfig {
     std::size_t opsPerThread = 500000;
     std::size_t minAllocSize = 16;
     std::size_t maxAllocSize = 4096;
+    static constexpr std::size_t kLatencySampleInterval = 50;   // sample every Nth op
+    static constexpr std::size_t kMaxLatencySamplesPerThread = 2000;
 };
 
 struct ThreadStats {
     std::size_t allocations = 0;
     std::size_t deallocations = 0;
+    std::vector<double> latencySamplesNs;  // optional samples for p50/p99
 };
 
 struct BenchmarkResult {
     double seconds = 0.0;
     std::size_t totalOps = 0;
     double throughputOpsPerSec = 0.0;
-    double meanLatencyNs = 0.0;  // mean nanoseconds per (alloc or free) operation
+    double meanLatencyNs = 0.0;
+    double p50LatencyNs = 0.0;
+    double p99LatencyNs = 0.0;
 };
 
 void worker(IAllocator& allocator,
@@ -66,11 +72,16 @@ void worker(IAllocator& allocator,
     std::uniform_int_distribution<int> opDist(0, 1);
     std::uniform_int_distribution<std::size_t> sizeDist(cfg.minAllocSize, cfg.maxAllocSize);
 
+    // Reserve to avoid vector realloc in hot path (same size distribution for both allocators).
     std::vector<void*> live;
-    live.reserve(1024);
+    live.reserve(std::min(cfg.opsPerThread, static_cast<std::size_t>(200000)));
 
     for (std::size_t i = 0; i < cfg.opsPerThread; ++i) {
         bool doAlloc = live.empty() || opDist(rng) == 0;
+        bool sampleLatency = (i % cfg.kLatencySampleInterval == 0) &&
+                            (stats.latencySamplesNs.size() < cfg.kMaxLatencySamplesPerThread);
+
+        auto t0 = high_resolution_clock::now();
         if (doAlloc) {
             std::size_t size = sizeDist(rng);
             void* ptr = allocator.allocate(size);
@@ -86,6 +97,11 @@ void worker(IAllocator& allocator,
             live[idx] = live.back();
             live.pop_back();
             ++stats.deallocations;
+        }
+        if (sampleLatency) {
+            auto t1 = high_resolution_clock::now();
+            stats.latencySamplesNs.push_back(
+                duration_cast<duration<double, std::nano>>(t1 - t0).count());
         }
     }
 
@@ -134,13 +150,31 @@ BenchmarkResult runBenchmark(const std::string& name,
         ? (seconds * 1e9 / static_cast<double>(totalOps))
         : 0.0;
 
+    // Approximate p50/p99 from sampled latencies (timing includes RNG + bookkeeping, same for both allocators).
+    std::vector<double> allSamples;
+    for (const auto& s : stats) {
+        for (double ns : s.latencySamplesNs) {
+            allSamples.push_back(ns);
+        }
+    }
+    double p50 = 0.0, p99 = 0.0;
+    if (allSamples.size() >= 2) {
+        std::sort(allSamples.begin(), allSamples.end());
+        p50 = allSamples[static_cast<std::size_t>(allSamples.size() * 0.50)];
+        p99 = allSamples[static_cast<std::size_t>(allSamples.size() * 0.99)];
+    }
+
     std::cout << "  Time: " << seconds << " s\n";
     std::cout << "  Operations: " << totalOps << " (alloc=" << totalAlloc
               << ", free=" << totalFree << ")\n";
     std::cout << "  Throughput: " << throughput << " ops/s\n";
-    std::cout << "  Mean latency: " << meanLatencyNs << " ns/op\n\n";
+    std::cout << "  Mean latency: " << meanLatencyNs << " ns/op\n";
+    if (allSamples.size() >= 2) {
+        std::cout << "  Latency p50/p99 (sampled): " << p50 << " / " << p99 << " ns/op\n";
+    }
+    std::cout << "  (Timing includes per-op RNG and bookkeeping; same for both allocators.)\n\n";
 
-    return BenchmarkResult{seconds, totalOps, throughput, meanLatencyNs};
+    return BenchmarkResult{seconds, totalOps, throughput, meanLatencyNs, p50, p99};
 }
 
 BenchmarkConfig parseArgs(int argc, char** argv) {
@@ -217,6 +251,10 @@ int main(int argc, char** argv) {
         : 0.0;
     std::cout << "\n  Relative throughput (NexusAlloc / glibc): " << speedup << "x\n";
     std::cout << "  NexusAlloc fragmentation estimate: " << custom.fragmentation() << "\n";
+    if (sysResult.p50LatencyNs > 0 && customResult.p50LatencyNs > 0) {
+        std::cout << "  Latency p50/p99: glibc " << sysResult.p50LatencyNs << "/" << sysResult.p99LatencyNs
+                  << " ns  |  NexusAlloc " << customResult.p50LatencyNs << "/" << customResult.p99LatencyNs << " ns\n";
+    }
 
     return 0;
 }

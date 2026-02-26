@@ -1,13 +1,13 @@
 ## NexusAlloc - C++17 Buddy Memory Allocator
 
-NexusAlloc is a **multi-threaded, high-performance buddy memory allocator** implemented in modern C++17. It is designed as a portfolio-quality project for **Distributed Systems / Low-Level Software Engineering** roles and showcases:
+NexusAlloc is a **multi-threaded buddy memory allocator** implemented in C++17. It is a portfolio project for **Distributed Systems / Low-Level Software Engineering** roles and demonstrates allocator design: manual memory management, lock-free structures, and predictable fragmentation—**benchmarked against** (not claiming to outperform) glibc `malloc`.
 
 - **Manual memory management** using `mmap` on Linux (no malloc/free wrappers)
-- **Lock-free free-list** with CAS-based pop/push and **per-thread caching** (64/128/256 B) for hot paths
-- **Buddy block allocation** to minimize fragmentation
-- **Benchmarking** against the system allocator (`glibc` `malloc`)
-- **Unit tests** with Google Test
-- **Debug-ability** with Valgrind and AddressSanitizer
+- **Lock-free free-list** in the buddy layer (CAS-based pop/push per order)
+- **Per-thread cache** (64/128/256 B) with batch refill from the global pool (cache access guarded by a shared mutex; see Design tradeoffs)
+- **Buddy block allocation** to reduce fragmentation and keep behavior predictable
+- **Benchmarking** vs glibc `malloc`: throughput (ops/s), mean and sampled p50/p99 latency
+- **Unit tests** (Google Test), **Valgrind** and **AddressSanitizer** for verification
 
 ### Project Structure
 
@@ -25,7 +25,7 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 cmake --build . -j
 ```
 
-On Windows this project will configure, but the allocator implementation targets **Linux** because it uses `mmap`/`munmap`.
+**Environment:** The allocator uses `mmap`/`munmap` and targets **Linux**. Recommended: build and run on **WSL (Ubuntu)** or **native Linux**. On a Windows host, use WSL and build inside the Linux filesystem (e.g. clone/copy the repo to `~/06-NexusAlloc`) to avoid CMake "Operation not permitted" on `/mnt/c`. See [Building](#building) above.
 
 ### Running Tests
 
@@ -47,11 +47,7 @@ From the `build` directory:
 ./benchmarks/nexusalloc_bench --threads 8 --ops-per-thread 500000 --profile small
 ```
 
-The benchmark prints:
-
-- **Throughput** in allocations/deallocations per second
-- **Custom allocator fragmentation ratio**
-- A comparison against the **system allocator** (`malloc` / `free`)
+The benchmark reports **throughput (ops/s)**, **mean latency (ns/op)**, and **approximate p50/p99 latency** (sampled). Timing includes per-op RNG and bookkeeping; both allocators see the same workload and overhead so the comparison is fair. It also prints relative throughput (NexusAlloc/glibc) and NexusAlloc fragmentation.
 
 ### Debugging and Verification
 
@@ -74,34 +70,37 @@ and then run the tests/benchmarks as usual. (ASan flags are typically added via 
 ### Architecture (High Level)
 
 - **`BuddyAllocator`**
-  - Owns a contiguous memory region reserved via **`mmap`** (no malloc/free wrappers)
-  - **Lock-free free-list**: each order uses an `std::atomic<BlockNode*>` head; **pop** and **push** use Compare-And-Swap (CAS) loops for thread-safe, non-blocking fast paths
-  - Coalesce on deallocate uses a **drain-and-merge** strategy: atomically drain the list for an order, remove the buddy in the drained list, merge, then push the merged block and any remaining nodes back
-  - Splits large blocks into smaller ones during allocation; maintains one free list per power-of-two order
-  - Exposes `getBlockOrder()`, `orderForSize()`, `blockSizeForOrder()` for integration with the upper layer
+  - Owns a contiguous region via **`mmap`** (no malloc/free).
+  - **Lock-free free-list**: one `std::atomic<FreeBlock*>` head per order; **pop** and **push** use Compare-And-Swap (CAS) loops for non-blocking alloc/free. No mutex in the buddy layer.
+  - **Coalesce** on deallocate: drain the list for that order (atomic exchange), remove the buddy from the drained list, merge, push merged block and remaining nodes back.
+  - Splits blocks by order; one free list per power-of-two order. Exposes `getBlockOrder()`, `orderForSize()`, `blockSizeForOrder()` for the cache layer.
 
 - **`MemoryAllocator`**
-  - RAII facade around `BuddyAllocator` with **per-thread caching**
-  - **Thread-local cache** for hot sizes (64 B, 128 B, 256 B): each thread has a small cache of blocks; `allocate()` checks the cache first and refills in batches from the global buddy allocator when empty; `deallocate()` returns blocks to the cache when under the cap, otherwise to the global pool
-  - Provides `allocate()`, `deallocate()`, `reallocate()` and stats for benchmarking and observability
+  - RAII facade with **per-thread cache buckets** for 64 B, 128 B, 256 B (orders 0–2). Access to these buckets is guarded by a **single shared mutex** (contention point).
+  - **allocate()**: if size maps to a cached order, take the mutex, check the thread’s bucket, pop if non-empty; else refill from the global buddy in a batch, then pop one. Otherwise call the buddy directly.
+  - **deallocate()**: if the block’s order is cached and that bucket is under the cap, push into the bucket; else return to the global buddy.
 
-The implementation is structured to be **readable**, **testable**, and to demonstrate systems-level C++ suitable for roles at companies like **NVIDIA**.
+### Design tradeoffs
+
+- **Lock-free fast path (buddy):** Allocation and the push side of deallocate are mutex-free; CAS retries can increase under contention on the same order.
+- **Coalescing:** We use drain-and-merge (exclusive access to the list for that order) instead of lock-free arbitrary remove.
+- **Fragmentation vs throughput:** Buddy allocation gives predictable, bounded fragmentation. This project does not aim to beat glibc’s throughput; it emphasizes design and reproducibility.
+- **Contention:** The per-thread cache uses one mutex for all threads; the global buddy free-lists are lock-free but can see CAS contention on popular orders.
 
 ---
 
 ### Performance proof
 
-Benchmarks run with the built-in suite (multi-threaded alloc/free mix). Build with `-DCMAKE_BUILD_TYPE=Release` and run:
+Benchmarks use the same workload for both allocators (thread count, ops/thread, size distribution). **`--profile mixed`**: sizes 16–4096 B; **`--profile small`**: 64–256 B (cache-friendly). Build with `-DCMAKE_BUILD_TYPE=Release` and run:
 
 ```bash
-# Mixed sizes (16 B–4 KB)
 ./benchmarks/nexusalloc_bench --threads 8 --ops-per-thread 500000
-
-# Cache-friendly (64–256 B)
 ./benchmarks/nexusalloc_bench --threads 8 --ops-per-thread 500000 --profile small
 ```
 
-**Results (8 threads, 500k ops/thread, WSL Ubuntu):**
+Reported: **ops/s**, **mean ns/op**, **p50/p99 ns/op** (sampled). Timing includes per-op RNG and bookkeeping (same for both), so relative numbers are comparable.
+
+**Example (8 threads, 500k ops/thread, WSL Ubuntu):**
 
 | Profile        | Allocator     | Throughput (ops/s) | Mean latency (ns/op) |
 |----------------|---------------|--------------------|----------------------|
@@ -110,5 +109,5 @@ Benchmarks run with the built-in suite (multi-threaded alloc/free mix). Build wi
 | Small (64–256 B)    | glibc malloc  | 1.16e+08           | 8.6                  |
 | Small (64–256 B)    | NexusAlloc    | 4.82e+06           | 207.5                |
 
-The suite reports throughput (alloc+free per second), mean latency per op, relative throughput (NexusAlloc/glibc), and fragmentation. Re-run the commands above on your machine to reproduce.
+NexusAlloc is slower than glibc on these workloads; the goal is to demonstrate allocator design and measurable, reproducible behavior, not to beat the system allocator.
 
