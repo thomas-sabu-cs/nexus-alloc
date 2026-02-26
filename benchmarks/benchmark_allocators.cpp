@@ -42,6 +42,7 @@ struct BenchmarkConfig {
                               ? std::thread::hardware_concurrency()
                               : 4;
     std::size_t opsPerThread = 500000;
+    std::size_t minAllocSize = 16;
     std::size_t maxAllocSize = 4096;
 };
 
@@ -53,6 +54,8 @@ struct ThreadStats {
 struct BenchmarkResult {
     double seconds = 0.0;
     std::size_t totalOps = 0;
+    double throughputOpsPerSec = 0.0;
+    double meanLatencyNs = 0.0;  // mean nanoseconds per (alloc or free) operation
 };
 
 void worker(IAllocator& allocator,
@@ -61,7 +64,7 @@ void worker(IAllocator& allocator,
             ThreadStats& stats) {
     std::mt19937_64 rng(seed);
     std::uniform_int_distribution<int> opDist(0, 1);
-    std::uniform_int_distribution<std::size_t> sizeDist(16, cfg.maxAllocSize);
+    std::uniform_int_distribution<std::size_t> sizeDist(cfg.minAllocSize, cfg.maxAllocSize);
 
     std::vector<void*> live;
     live.reserve(1024);
@@ -126,14 +129,18 @@ BenchmarkResult runBenchmark(const std::string& name,
         totalFree += s.deallocations;
     }
 
-    double throughput = totalOps / seconds;
+    double throughput = (seconds > 0.0) ? (totalOps / seconds) : 0.0;
+    double meanLatencyNs = (totalOps > 0 && seconds > 0.0)
+        ? (seconds * 1e9 / static_cast<double>(totalOps))
+        : 0.0;
 
     std::cout << "  Time: " << seconds << " s\n";
     std::cout << "  Operations: " << totalOps << " (alloc=" << totalAlloc
               << ", free=" << totalFree << ")\n";
-    std::cout << "  Throughput: " << throughput << " ops/s\n\n";
+    std::cout << "  Throughput: " << throughput << " ops/s\n";
+    std::cout << "  Mean latency: " << meanLatencyNs << " ns/op\n\n";
 
-    return BenchmarkResult{seconds, totalOps};
+    return BenchmarkResult{seconds, totalOps, throughput, meanLatencyNs};
 }
 
 BenchmarkConfig parseArgs(int argc, char** argv) {
@@ -151,13 +158,26 @@ BenchmarkConfig parseArgs(int argc, char** argv) {
             cfg.threads = static_cast<std::size_t>(std::stoul(next()));
         } else if (arg == "--ops-per-thread") {
             cfg.opsPerThread = static_cast<std::size_t>(std::stoul(next()));
+        } else if (arg == "--min-size") {
+            cfg.minAllocSize = static_cast<std::size_t>(std::stoul(next()));
         } else if (arg == "--max-size") {
             cfg.maxAllocSize = static_cast<std::size_t>(std::stoul(next()));
+        } else if (arg == "--profile") {
+            std::string p = next();
+            if (p == "small") {
+                cfg.minAllocSize = 64;
+                cfg.maxAllocSize = 256;
+            } else if (p == "mixed") {
+                cfg.minAllocSize = 16;
+                cfg.maxAllocSize = 4096;
+            }
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: nexusalloc_bench [options]\n"
                          "  --threads N          Number of worker threads\n"
                          "  --ops-per-thread N   Operations per thread\n"
-                         "  --max-size BYTES     Maximum allocation size\n";
+                         "  --min-size BYTES     Minimum allocation size\n"
+                         "  --max-size BYTES     Maximum allocation size\n"
+                         "  --profile PROFILE    Preset: mixed (16-4096 B) or small (64-256 B, cache-friendly)\n";
             std::exit(0);
         }
     }
@@ -171,31 +191,32 @@ int main(int argc, char** argv) {
 
     std::cout << "Threads: " << cfg.threads
               << ", ops/thread: " << cfg.opsPerThread
-              << ", max size: " << cfg.maxAllocSize << " bytes\n\n";
+              << ", size range: " << cfg.minAllocSize << "-" << cfg.maxAllocSize << " bytes\n\n";
 
     SystemAllocator sysAlloc;
     auto sysResult = runBenchmark("System malloc/free", sysAlloc, cfg);
 
     nexusalloc::MemoryAllocator::Config allocCfg;
-    allocCfg.poolSizeBytes = 512ull * 1024 * 1024;
+    allocCfg.poolSizeBytes = 1024ull * 1024 * 1024;  // 1 GiB so 8 threads × 500k ops don't exhaust
     allocCfg.minBlockSizeBytes = 64;
 
     nexusalloc::MemoryAllocator custom(allocCfg);
     CustomAllocatorAdapter customAdapter(custom);
     auto customResult = runBenchmark("NexusAlloc buddy allocator", customAdapter, cfg);
 
-    double sysThroughput = sysResult.totalOps / sysResult.seconds;
-    double customThroughput = customResult.totalOps / customResult.seconds;
+    std::cout << "=== Summary (multi-threaded workload) ===\n";
+    std::cout << "  Allocator        | Throughput (ops/s) | Mean latency (ns/op)\n";
+    std::cout << "  -----------------|--------------------|----------------------\n";
+    std::cout << "  glibc malloc     | " << sysResult.throughputOpsPerSec << "        | "
+              << sysResult.meanLatencyNs << "\n";
+    std::cout << "  NexusAlloc      | " << customResult.throughputOpsPerSec << "        | "
+              << customResult.meanLatencyNs << "\n";
 
-    std::cout << "=== Summary ===\n";
-    std::cout << "System malloc/free throughput: " << sysThroughput << " ops/s\n";
-    std::cout << "NexusAlloc throughput:         " << customThroughput << " ops/s\n";
-
-    double speedup = customThroughput / sysThroughput;
-    std::cout << "Relative speed (NexusAlloc / system): " << speedup << "x\n";
-
-    std::cout << "NexusAlloc fragmentation estimate: "
-              << custom.fragmentation() << "\n";
+    double speedup = (sysResult.throughputOpsPerSec > 0.0)
+        ? (customResult.throughputOpsPerSec / sysResult.throughputOpsPerSec)
+        : 0.0;
+    std::cout << "\n  Relative throughput (NexusAlloc / glibc): " << speedup << "x\n";
+    std::cout << "  NexusAlloc fragmentation estimate: " << custom.fragmentation() << "\n";
 
     return 0;
 }

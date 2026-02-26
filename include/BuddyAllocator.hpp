@@ -3,13 +3,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
+#include <memory>
 #include <vector>
 
 namespace nexusalloc {
 
 // Low-level buddy allocator managing a contiguous memory pool.
-// Thread safe: public methods take an internal mutex.
+// Thread safe: lock-free free-list (CAS-based pop/push); coalesce uses drain-and-merge.
 class BuddyAllocator {
 public:
     struct Options {
@@ -17,7 +17,7 @@ public:
         std::size_t minBlockSizeBytes = 64;               // minimum block size (power-of-two base)
     };
 
-    explicit BuddyAllocator(const Options& options = Options{});
+    explicit BuddyAllocator(const Options& options = {256ull * 1024 * 1024, 64});
     ~BuddyAllocator();
 
     BuddyAllocator(const BuddyAllocator&) = delete;
@@ -35,6 +35,19 @@ public:
 
     // Fragmentation estimate in [0, 1]. 0 = no fragmentation, 1 = fully free.
     double fragmentation() const noexcept;
+
+    // Returns the order of the block containing ptr (for cache bucketing). Undefined if ptr is invalid.
+    std::uint32_t getBlockOrder(void* ptr) const noexcept;
+
+    // Order needed for a given allocation size. Used by MemoryAllocator cache.
+    std::uint32_t orderForSize(std::size_t size) const noexcept;
+
+    // Block size for a given order (minBlockSize << order). Used by MemoryAllocator cache.
+    std::size_t blockSizeForOrder(std::uint32_t order) const noexcept {
+        return m_minBlockSize << order;
+    }
+
+    std::size_t blockHeaderSize() const noexcept { return sizeof(BlockHeader); }
 
 private:
     struct BlockHeader {
@@ -55,17 +68,13 @@ private:
         return value != 0 && (value & (value - 1)) == 0;
     }
 
-    std::size_t blockSizeForOrder(std::uint32_t order) const noexcept {
-        return m_minBlockSize << order;
-    }
-
-    std::uint32_t orderForSize(std::size_t size) const noexcept;
-
     void initializeFreeLists();
 
+    // Lock-free free-list: CAS-based pop/push.
     FreeBlock* popFreeBlock(std::uint32_t order);
     void pushFreeBlock(std::uint32_t order, FreeBlock* block);
-    void removeFreeBlock(std::uint32_t order, FreeBlock* block);
+    // Drain entire list for an order (used by coalesce). Returns head; list head becomes nullptr.
+    FreeBlock* drainFreeList(std::uint32_t order);
 
     void splitBlockDown(FreeBlock* block, std::uint32_t fromOrder, std::uint32_t toOrder);
     FreeBlock* coalesce(FreeBlock* block);
@@ -79,8 +88,8 @@ private:
     std::size_t m_minBlockSize{0};
     std::uint32_t m_maxOrder{0};
 
-    std::vector<FreeBlock*> m_freeLists;
-    mutable std::mutex m_mutex;
+    // One atomic head per order (lock-free stack). Uses raw array because std::atomic is not copyable.
+    std::unique_ptr<std::atomic<FreeBlock*>[]> m_freeListHeads;
     std::atomic<std::size_t> m_allocatedBytes{0};
 };
 

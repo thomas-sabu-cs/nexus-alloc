@@ -68,7 +68,7 @@ BuddyAllocator::BuddyAllocator(const Options& options)
         --m_maxOrder;
     }
 
-    m_freeLists.resize(m_maxOrder + 1, nullptr);
+    m_freeListHeads.reset(new std::atomic<FreeBlock*>[m_maxOrder + 1]());
 
     void* base = mmap(nullptr, m_poolSizeEffective, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -92,7 +92,7 @@ void BuddyAllocator::initializeFreeLists() {
     initial->header.order = m_maxOrder;
     initial->header.isFree = 1;
     initial->next = nullptr;
-    m_freeLists[m_maxOrder] = initial;
+    m_freeListHeads[m_maxOrder].store(initial, std::memory_order_release);
     m_allocatedBytes.store(0, std::memory_order_relaxed);
 }
 
@@ -113,40 +113,34 @@ std::uint32_t BuddyAllocator::orderForSize(std::size_t size) const noexcept {
 }
 
 BuddyAllocator::FreeBlock* BuddyAllocator::popFreeBlock(std::uint32_t order) {
-    FreeBlock* head = m_freeLists[order];
-    if (!head) {
-        return nullptr;
+    std::atomic<FreeBlock*>& headRef = m_freeListHeads[order];
+    FreeBlock* head = headRef.load(std::memory_order_acquire);
+    while (head != nullptr) {
+        FreeBlock* next = head->next;
+        if (headRef.compare_exchange_weak(head, next, std::memory_order_release)) {
+            head->header.isFree = 0;
+            head->next = nullptr;
+            return head;
+        }
     }
-    m_freeLists[order] = head->next;
-    head->header.isFree = 0;
-    head->next = nullptr;
-    return head;
+    return nullptr;
 }
 
 void BuddyAllocator::pushFreeBlock(std::uint32_t order, FreeBlock* block) {
     block->header.order = order;
     block->header.isFree = 1;
-    block->next = m_freeLists[order];
-    m_freeLists[order] = block;
+    std::atomic<FreeBlock*>& headRef = m_freeListHeads[order];
+    FreeBlock* head = headRef.load(std::memory_order_acquire);
+    for (;;) {
+        block->next = head;
+        if (headRef.compare_exchange_weak(head, block, std::memory_order_release)) {
+            return;
+        }
+    }
 }
 
-void BuddyAllocator::removeFreeBlock(std::uint32_t order, FreeBlock* block) {
-    FreeBlock* prev = nullptr;
-    FreeBlock* cur = m_freeLists[order];
-    while (cur && cur != block) {
-        prev = cur;
-        cur = cur->next;
-    }
-    if (!cur) {
-        return;
-    }
-    if (prev) {
-        prev->next = cur->next;
-    } else {
-        m_freeLists[order] = cur->next;
-    }
-    cur->header.isFree = 0;
-    cur->next = nullptr;
+BuddyAllocator::FreeBlock* BuddyAllocator::drainFreeList(std::uint32_t order) {
+    return m_freeListHeads[order].exchange(nullptr, std::memory_order_acq_rel);
 }
 
 void BuddyAllocator::splitBlockDown(FreeBlock* block, std::uint32_t fromOrder, std::uint32_t toOrder) {
@@ -164,8 +158,7 @@ void BuddyAllocator::splitBlockDown(FreeBlock* block, std::uint32_t fromOrder, s
         left->header.isFree = 0;
         right->header.order = order;
         right->header.isFree = 1;
-        right->next = m_freeLists[order];
-        m_freeLists[order] = right;
+        pushFreeBlock(order, right);
 
         block = left;
     }
@@ -194,8 +187,6 @@ void* BuddyAllocator::allocate(std::size_t size) {
     if (size == 0) {
         return nullptr;
     }
-
-    std::lock_guard<std::mutex> lock(m_mutex);
 
     std::uint32_t order = orderForSize(size);
     if (order > m_maxOrder) {
@@ -241,11 +232,29 @@ BuddyAllocator::FreeBlock* BuddyAllocator::coalesce(FreeBlock* block) {
         }
 
         auto* buddy = reinterpret_cast<FreeBlock*>(base + buddyOffset);
-        if (!buddy->header.isFree || buddy->header.order != order) {
-            break;
+
+        // Drain the free list for this order so we can remove buddy.
+        FreeBlock* listHead = drainFreeList(order);
+        FreeBlock* found = nullptr;
+        FreeBlock* cur = listHead;
+        while (cur != nullptr) {
+            FreeBlock* next = cur->next;
+            if (cur == buddy) {
+                found = buddy;
+                cur->header.isFree = 0;
+                cur->next = nullptr;
+            } else {
+                pushFreeBlock(order, cur);
+            }
+            cur = next;
         }
 
-        removeFreeBlock(order, buddy);
+        if (!found || found->header.order != order) {
+            // Buddy not in list (or wrong order); return block for caller to push.
+            block->header.order = order;
+            block->header.isFree = 1;
+            return block;
+        }
 
         std::size_t combinedOffset = std::min(offset, buddyOffset);
         block = reinterpret_cast<FreeBlock*>(base + combinedOffset);
@@ -264,8 +273,6 @@ void BuddyAllocator::deallocate(void* ptr) {
     if (!ptr) {
         return;
     }
-
-    std::lock_guard<std::mutex> lock(m_mutex);
 
     BlockHeader* header = headerFromUserPtr(ptr);
     if (!header) {
@@ -296,8 +303,6 @@ void* BuddyAllocator::reallocate(void* ptr, std::size_t newSize) {
         return nullptr;
     }
 
-    std::lock_guard<std::mutex> lock(m_mutex);
-
     BlockHeader* header = headerFromUserPtr(ptr);
     if (!header) {
         return nullptr;
@@ -310,9 +315,6 @@ void* BuddyAllocator::reallocate(void* ptr, std::size_t newSize) {
     if (newSize <= usable) {
         return ptr;
     }
-
-    std::lock_guard<std::mutex> unlockGuard(m_mutex, std::adopt_lock);
-    (void)unlockGuard;
 
     void* newPtr = allocate(newSize);
     if (!newPtr) {
@@ -332,6 +334,11 @@ double BuddyAllocator::fragmentation() const noexcept {
     std::size_t allocated = allocatedSize();
     double usedRatio = static_cast<double>(allocated) / static_cast<double>(total);
     return 1.0 - usedRatio;
+}
+
+std::uint32_t BuddyAllocator::getBlockOrder(void* ptr) const noexcept {
+    BlockHeader* h = headerFromUserPtr(ptr);
+    return h ? h->order : 0;
 }
 
 } // namespace nexusalloc
