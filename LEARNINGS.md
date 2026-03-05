@@ -1,5 +1,7 @@
 # LEARNINGS — NexusAlloc (Buddy Memory Allocator)
 
+**tl;dr:** Implemented a C++17 buddy allocator on top of `mmap` with lock-free free-lists and a per-thread small-block cache. Learned where things actually get hard: correct order/alignment math, safe coalescing with a lock-free stack (drain-and-merge), contention from CAS under load, and how to benchmark fairly against glibc across realistic size profiles.
+
 ## 1. What I Attempted
 
 - **Multi-threaded buddy allocator in C++17** using `mmap` for the pool (no malloc/free). One contiguous region, power-of-two block sizes, split and merge (coalesce) on alloc/free.
