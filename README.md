@@ -111,3 +111,15 @@ Reported: **ops/s**, **mean ns/op**, **p50/p99 ns/op** (sampled). Timing include
 
 NexusAlloc is slower than glibc on these workloads; the goal is to demonstrate allocator design and measurable, reproducible behavior, not to beat the system allocator.
 
+---
+
+### Learning log
+
+- **Buddy allocation** gives predictable, bounded fragmentation (power-of-two blocks; split/merge is deterministic) at the cost of internal fragmentation and more bookkeeping than a single free-list.
+- **Lock-free free-lists** (one atomic head per order, CAS push/pop) avoid a global mutex but require drain-and-merge for coalescing, since arbitrary removal on a lock-free stack is not used.
+- **Per-thread caches** for hot sizes (64/128/256 B) reduce traffic to the global buddy and batch refills; a single shared mutex for cache access is a known contention point (see Design tradeoffs).
+- **Benchmarking** with identical workload for both allocators (and timing that includes the same RNG/bookkeeping) keeps relative throughput and latency comparable; reporting mean and p50/p99 (sampled) gives a clearer picture than mean alone.
+- **Tests (Google Test) and tools (Valgrind, ASan)** guard basic behavior, exhaustion, and concurrency; the audit (AUDIT.md) and this log keep README claims aligned with the implementation.
+
+→ Full technical learning log: [LEARNINGS.md](./LEARNINGS.md)
+
